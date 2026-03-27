@@ -104,6 +104,8 @@ class Hyperparameters:
     bigram_prior_path=os.environ.get("BIGRAM_PRIOR_PATH", None)
     prior_max_step = int(os.environ.get("PRIOR_MAX_STEP", 500))
     prior_alpha_start = float(os.environ.get("PRIOR_ALPHA_START", 1.0))
+    prior_kl_weight = float(os.environ.get("PRIOR_KL_WEIGHT", 0.0))
+    prior_kl_temp = float(os.environ.get("PRIOR_KL_TEMP", 1.0))
     
 # --- Batched Newton-Schulz orthogonalization ---
 
@@ -850,6 +852,8 @@ class GPT(nn.Module):
         gated_attention: bool = False,
         value_residual: bool = False,
         bigram_prior_path: str = None,
+        prior_kl_weight: float = 0.0,
+        prior_kl_temp: float = 1.0,
     ):
         super().__init__()
 
@@ -868,6 +872,8 @@ class GPT(nn.Module):
 
         # ----- bigram prior ----
         self.bigram_prior = BigramPrior.load(bigram_prior_path, vocab_size) if bigram_prior_path else None
+        self.prior_kl_weight = prior_kl_weight
+        self.prior_kl_temp = prior_kl_temp
 
         self.smear = SmearGate(model_dim)
         self.num_encoder_layers = num_layers // 2
@@ -964,9 +970,15 @@ class GPT(nn.Module):
         ve_base = ve_cache['ve'] if ve_cache is not None else self.ve_shared(input_ids)
         ve_idx = self.ve_layer_indices.index(layer_idx)
         return ve_base * self.ve_layer_scales[ve_idx].to(dtype=ve_base.dtype)
-    
-    def forward(self, input_ids: Tensor, target_ids: Tensor, prior_alpha: Tensor | None = None) -> Tensor:
 
+
+    def forward(
+        self,
+        input_ids: Tensor,
+        target_ids: Tensor,
+        prior_alpha: Tensor | None = None,
+        return_components: bool = False,
+    ):
         n = self.num_layers
         x = self.tok_emb(input_ids)
         if self.bigram is not None:
@@ -977,68 +989,122 @@ class GPT(nn.Module):
         v0 = None
         skips: list[Tensor] = []
         ve_cache: dict = {}
+
         for i in range(self.num_encoder_layers):
             ve = self._get_ve(i, input_ids, ve_cache)
-            x, raw_v = self.blocks[i](x, x0,
+            x, raw_v = self.blocks[i](
+                x, x0,
                 self.qo_bank[i], self.kv_bank[i], self.kv_bank[n + i],
                 self.qo_bank[n + i], self.mlp_up_bank[i], self.mlp_down_bank[i],
-                v_embed=ve, v0=v0)
+                v_embed=ve, v0=v0
+            )
             if v0 is None and raw_v is not None:
                 v0 = raw_v
             skips.append(x)
+
         for i in range(self.num_decoder_layers):
             bi = self.num_encoder_layers + i
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
             ve = self._get_ve(bi, input_ids, ve_cache)
-            x, _ = self.blocks[bi](x, x0,
+            x, _ = self.blocks[bi](
+                x, x0,
                 self.qo_bank[bi], self.kv_bank[bi], self.kv_bank[n + bi],
                 self.qo_bank[n + bi], self.mlp_up_bank[bi], self.mlp_down_bank[bi],
-                v_embed=ve, v0=v0)
+                v_embed=ve, v0=v0
+            )
+
         x = self.final_norm(x)
 
         x_flat = x.reshape(-1, x.size(-1))
-        targets = target_ids.reshape(-1)
         if self.tie_embeddings:
             logits_proj = F.linear(x_flat, self.tok_emb.weight)
         else:
             if self.lm_head is None:
                 raise RuntimeError("lm_head is required when tie_embeddings=False")
             logits_proj = self.lm_head(x_flat)
-        
+
         B, T, _ = x.shape
         logits = logits_proj.view(B, T, -1)
 
-        if self.bigram_prior is not None and prior_alpha is not None:
-            prev_tokens = input_ids[:, :-1]
-            prior = self.bigram_prior(prev_tokens)
-            logits[:, :-1, :] += prior_alpha.to(dtype=logits.dtype) * prior
-
         logits = self.logit_softcap * torch.tanh(logits / self.logit_softcap)
 
-        logits = logits.reshape(-1, logits.size(-1))
-        targets = target_ids.reshape(-1)
+        logits_flat = logits.reshape(-1, logits.size(-1))
+        targets_flat = target_ids.reshape(-1)
 
-        main_loss = F.cross_entropy(logits.float(), targets, reduction="mean")
+        ce_loss = F.cross_entropy(
+            logits_flat.float(),
+            targets_flat,
+            reduction="mean",
+            ignore_index=-1,
+        )
+
+        raw_kl_loss = logits.new_zeros((), dtype=torch.float32)
+        weighted_kl_loss = logits.new_zeros((), dtype=torch.float32)
+
+        # KL(prior || model) regularization
+        if (
+            self.bigram_prior is not None
+            and prior_alpha is not None
+            and self.prior_kl_weight > 0.0
+        ):
+            prev_tokens = input_ids[:, :-1]                 # (B, T-1)
+            prior_logits = self.bigram_prior(prev_tokens)   # (B, T-1, V)
+            model_logits = logits[:, :-1, :]                # (B, T-1, V)
+
+            T_kl = self.prior_kl_temp
+
+            model_log_probs = F.log_softmax(model_logits.float() / T_kl, dim=-1)
+            prior_log_probs = F.log_softmax(prior_logits.float() / T_kl, dim=-1)
+
+            kl_per_tok = F.kl_div(
+                model_log_probs,
+                prior_log_probs,
+                reduction="none",
+                log_target=True,
+            ).sum(dim=-1)  # (B, T-1)
+
+            kl_mask = (target_ids[:, :-1] != -1).float()
+            raw_kl_loss = (kl_per_tok * kl_mask).sum() / kl_mask.sum().clamp_min(1.0)
+            weighted_kl_loss = self.prior_kl_weight * prior_alpha.float() * (T_kl * T_kl) * raw_kl_loss
+
+        mtp_loss = logits.new_zeros((), dtype=torch.float32)
+
         if self.training and self.mtp_num_heads > 0 and self.mtp_loss_weight > 0.0:
             _, seqlen, dim = x.shape
-            mtp_loss_sum = x.new_zeros(())
+            mtp_loss_sum = x.new_zeros((), dtype=torch.float32)
             mtp_loss_count = 0
             for k, mtp_head in enumerate(self.mtp_heads):
                 valid_t = seqlen - (k + 1)
                 if valid_t <= 0:
                     continue
                 mtp_hidden = x[:, :valid_t, :].reshape(-1, dim)
-                mtp_targets = target_ids[:, k + 1 :].reshape(-1)
+                mtp_targets = target_ids[:, k + 1:].reshape(-1)
                 mtp_logits_proj = mtp_head(mtp_hidden)
                 mtp_logits = self.logit_softcap * torch.tanh(mtp_logits_proj / self.logit_softcap)
-                mtp_loss_sum = mtp_loss_sum + F.cross_entropy(mtp_logits.float(), mtp_targets, reduction="mean")
+                mtp_loss_sum = mtp_loss_sum + F.cross_entropy(
+                    mtp_logits.float(),
+                    mtp_targets,
+                    reduction="mean",
+                    ignore_index=-1,
+                )
                 mtp_loss_count += 1
             if mtp_loss_count > 0:
-                main_loss = main_loss + self.mtp_loss_weight * (mtp_loss_sum / mtp_loss_count)
+                mtp_loss = self.mtp_loss_weight * (mtp_loss_sum / mtp_loss_count)
 
-        return main_loss
-    
+        total_loss = ce_loss + weighted_kl_loss + mtp_loss
+
+        if return_components:
+            return (
+                total_loss,
+                ce_loss.detach(),
+                raw_kl_loss.detach(),
+                weighted_kl_loss.detach(),
+                mtp_loss.detach(),
+            )
+        return total_loss
+
+
     def forward_logits(self, input_ids: Tensor) -> Tensor:
         """Return logits (bsz, seq_len, vocab) without computing loss."""
         n = self.num_layers
@@ -1558,6 +1624,8 @@ def main() -> None:
         gated_attention=args.gated_attention,
         value_residual=args.value_residual,
         bigram_prior_path=args.bigram_prior_path,
+        prior_kl_weight=args.prior_kl_weight,
+        prior_kl_temp=args.prior_kl_temp,
     ).to(device).bfloat16()
     # Banks stay FP32 (like CastedLinear weights), cast to BF16 in forward
     base_model.qo_bank.data = base_model.qo_bank.data.float()
@@ -1758,7 +1826,12 @@ def main() -> None:
             CastedLinear._qat_enabled = True
             log0(f"late_qat:enabled step:{step} scale:{scale:.4f}")
         zero_grad_all()
+
         train_loss = torch.zeros((), device=device)
+        train_ce_loss = torch.zeros((), device=device)
+        train_raw_kl_loss = torch.zeros((), device=device)
+        train_weighted_kl_loss = torch.zeros((), device=device)
+        train_mtp_loss = torch.zeros((), device=device)
 
         alpha_value = get_alpha(step, max_step=args.prior_max_step, alpha_start=args.prior_alpha_start)
         prior_alpha = torch.tensor(alpha_value, device=device, dtype=torch.float32)
@@ -1766,10 +1839,23 @@ def main() -> None:
         for micro_step in range(grad_accum_steps):
             x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                loss = model(x, y, prior_alpha)
+                loss, ce_loss, raw_kl_loss, weighted_kl_loss, mtp_loss = model(
+                    x, y, prior_alpha, return_components=True
+                )
             train_loss += loss.detach()
+            train_ce_loss += ce_loss
+            train_raw_kl_loss += raw_kl_loss
+            train_weighted_kl_loss += weighted_kl_loss
+            train_mtp_loss += mtp_loss
             (loss * grad_scale).backward()
+
         train_loss /= grad_accum_steps
+        train_ce_loss /= grad_accum_steps
+        train_raw_kl_loss /= grad_accum_steps
+        train_weighted_kl_loss /= grad_accum_steps
+        train_mtp_loss /= grad_accum_steps
+
+
         frac = min(step / args.muon_momentum_warmup_steps, 1.0) if args.muon_momentum_warmup_steps > 0 else 1.0
         muon_momentum = (1 - frac) * args.muon_momentum_warmup_start + frac * args.muon_momentum
         for group in optimizer_muon.param_groups:
@@ -1818,10 +1904,18 @@ def main() -> None:
             and (step <= 10 or step % args.train_log_every == 0 or stop_after_step is not None)
         )
         if should_log_train:
+            effective_kl_coeff = args.prior_kl_weight * alpha_value
             log0(
-                f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
+                f"step:{step}/{args.iterations} "
+                f"train_total:{train_loss.item():.4f} "
+                f"train_ce:{train_ce_loss.item():.4f} "
+                f"train_raw_kl:{train_raw_kl_loss.item():.4f} "
+                f"train_kl:{train_weighted_kl_loss.item():.4f} "
+                f"train_mtp:{train_mtp_loss.item():.4f} "
                 f"alpha:{alpha_value:.4f} "
-                f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
+                f"kl_coeff:{effective_kl_coeff:.4f} "
+                f"train_time:{approx_training_time_ms:.0f}ms "
+                f"step_avg:{approx_training_time_ms / step:.2f}ms"
             )
         reached_cap = max_wallclock_ms is not None and approx_training_time_ms >= max_wallclock_ms
         if distributed and max_wallclock_ms is not None:
@@ -1911,6 +2005,8 @@ def main() -> None:
         ve_enabled=args.ve_enabled, ve_dim=args.ve_dim, ve_layers=args.ve_layers,
         gated_attention=args.gated_attention, value_residual=args.value_residual,
         bigram_prior_path=args.bigram_prior_path,
+        prior_kl_weight=args.prior_kl_weight,
+        prior_kl_temp=args.prior_kl_temp,
     ).to(device).bfloat16()
     eval_model.qo_bank.data = eval_model.qo_bank.data.float()
     eval_model.kv_bank.data = eval_model.kv_bank.data.float()
