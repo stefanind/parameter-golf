@@ -1,5 +1,3 @@
-   
-
 from __future__ import annotations
 import copy
 import glob
@@ -1828,7 +1826,6 @@ def main() -> None:
         zero_grad_all()
 
         train_loss = torch.zeros((), device=device)
-        train_ce_loss = torch.zeros((), device=device)
         train_raw_kl_loss = torch.zeros((), device=device)
         train_weighted_kl_loss = torch.zeros((), device=device)
         train_mtp_loss = torch.zeros((), device=device)
@@ -1836,24 +1833,37 @@ def main() -> None:
         alpha_value = get_alpha(step, max_step=args.prior_max_step, alpha_start=args.prior_alpha_start)
         prior_alpha = torch.tensor(alpha_value, device=device, dtype=torch.float32)
 
+        next_step = step + 1
+        should_log_train = (
+            args.train_log_every > 0
+            and (next_step <= 500 or next_step % args.train_log_every == 0 or stop_after_step is not None)
+        )
+
         for micro_step in range(grad_accum_steps):
             x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
+
+            # compiled path: scalar loss only
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                loss, ce_loss, raw_kl_loss, weighted_kl_loss, mtp_loss = model(
-                    x, y, prior_alpha, return_components=True
-                )
+                loss = model(x, y, prior_alpha)
             train_loss += loss.detach()
-            train_ce_loss += ce_loss
-            train_raw_kl_loss += raw_kl_loss
-            train_weighted_kl_loss += weighted_kl_loss
-            train_mtp_loss += mtp_loss
             (loss * grad_scale).backward()
 
+            # uncompiled path: logging components only
+            if should_log_train:
+                with torch.no_grad():
+                    with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                        _, ce_loss, raw_kl_loss, weighted_kl_loss, mtp_loss = base_model(
+                            x, y, prior_alpha, return_components=True
+                        )
+                train_raw_kl_loss += raw_kl_loss
+                train_weighted_kl_loss += weighted_kl_loss
+                train_mtp_loss += mtp_loss
+
         train_loss /= grad_accum_steps
-        train_ce_loss /= grad_accum_steps
-        train_raw_kl_loss /= grad_accum_steps
-        train_weighted_kl_loss /= grad_accum_steps
-        train_mtp_loss /= grad_accum_steps
+        if should_log_train:
+            train_raw_kl_loss /= grad_accum_steps
+            train_weighted_kl_loss /= grad_accum_steps
+            train_mtp_loss /= grad_accum_steps
 
 
         frac = min(step / args.muon_momentum_warmup_steps, 1.0) if args.muon_momentum_warmup_steps > 0 else 1.0
@@ -1899,16 +1909,12 @@ def main() -> None:
                 swa_count += 1
         if args.lawa_enabled and step % args.lawa_freq == 0:
             lawa_queue.append({name: t.detach().cpu().clone() for name, t in base_model.state_dict().items()})
-        should_log_train = (
-            args.train_log_every > 0
-            and (step <= 10 or step % args.train_log_every == 0 or stop_after_step is not None)
-        )
+
         if should_log_train:
             effective_kl_coeff = args.prior_kl_weight * alpha_value
             log0(
                 f"step:{step}/{args.iterations} "
                 f"train_total:{train_loss.item():.4f} "
-                f"train_ce:{train_ce_loss.item():.4f} "
                 f"train_raw_kl:{train_raw_kl_loss.item():.4f} "
                 f"train_kl:{train_weighted_kl_loss.item():.4f} "
                 f"train_mtp:{train_mtp_loss.item():.4f} "
