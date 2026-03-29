@@ -100,8 +100,8 @@ class Hyperparameters:
     ttt_grad_clip = float(os.environ.get("TTT_GRAD_CLIP", 1.0))
 
     bigram_prior_path=os.environ.get("BIGRAM_PRIOR_PATH", None)
-    prior_max_step = int(os.environ.get("PRIOR_MAX_STEP", 500))
-    prior_alpha_start = float(os.environ.get("PRIOR_ALPHA_START", 1.0))
+    prior_max_step = int(os.environ.get("PRIOR_MAX_STEP", 2000))
+    prior_alpha_start = float(os.environ.get("PRIOR_ALPHA_START", 0.0))
 
     # exp 3:
     use_unigram_bias_init = bool(int(os.environ.get("USE_UNIGRAM_BIAS_INIT", "0")))
@@ -1783,15 +1783,18 @@ def main() -> None:
         scalar_params.append(base_model.skip_weights)
     scalar_params.append(base_model.smear.gate)
     # exp 3:
-    scalar_params.append(base_model.lm_head_bias)
+
     if base_model.bigram is not None:
         scalar_params.append(base_model.bigram.scale)
+
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     tok_params = [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}]
+
     if base_model.bigram is not None:
         tok_params.append({"params": [base_model.bigram.embed.weight], "lr": token_lr, "base_lr": token_lr})
         if base_model.bigram.proj is not None:
             scalar_params.append(base_model.bigram.proj.weight)
+
     if base_model.ve_shared is not None:
         tok_params.append({"params": [base_model.ve_shared.embed.weight], "lr": token_lr, "base_lr": token_lr})
         if base_model.ve_shared.proj is not None:
@@ -1799,50 +1802,68 @@ def main() -> None:
         scalar_params.append(base_model.ve_shared.scale)
         for s in base_model.ve_layer_scales:
             scalar_params.append(s)
+    
+        # exp3: don't decay the head bias
+        scalar_no_decay_params = [base_model.lm_head_bias]
 
-    optimizer_tok = torch.optim.AdamW(
-        tok_params,
-        betas=(args.beta1, args.beta2),
-        eps=args.adam_eps,
-        weight_decay=args.adam_wd,
-        fused=True,
-    )
-    optimizer_muon = Muon(
-        matrix_params,
-        lr=args.matrix_lr,
-        momentum=args.muon_momentum,
-        backend_steps=args.muon_backend_steps,
-        weight_decay=args.muon_wd,
-    )
-    for group in optimizer_muon.param_groups:
-        group["base_lr"] = args.matrix_lr
-    optimizer_scalar = torch.optim.AdamW(
-        [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
-        betas=(args.beta1, args.beta2),
-        eps=args.adam_eps,
-        weight_decay=args.adam_wd,
-        fused=True,
-    )
-    # Non-bank params that need manual all-reduce (replicated across GPUs)
-    replicated_params = list(optimizer_tok.param_groups[0]["params"])
-    for pg in optimizer_tok.param_groups[1:]:
-        replicated_params.extend(pg["params"])
-    replicated_params.extend(scalar_params)
-
-    optimizer_head = None
-    if base_model.lm_head is not None:
-        optimizer_head = torch.optim.Adam(
-            [{"params": [base_model.lm_head.weight], "lr": args.head_lr, "base_lr": args.head_lr}],
+        optimizer_tok = torch.optim.AdamW(
+            tok_params,
+            betas=(args.beta1, args.beta2),
+            eps=args.adam_eps,
+            weight_decay=args.adam_wd,
+            fused=True,
+        )
+        
+        optimizer_muon = Muon(
+            matrix_params,
+            lr=args.matrix_lr,
+            momentum=args.muon_momentum,
+            backend_steps=args.muon_backend_steps,
+            weight_decay=args.muon_wd,
+        )
+        for group in optimizer_muon.param_groups:
+            group["base_lr"] = args.matrix_lr
+        
+        optimizer_scalar = torch.optim.AdamW(
+            [
+                {
+                    "params": scalar_params,
+                    "lr": args.scalar_lr,
+                    "base_lr": args.scalar_lr,
+                    "weight_decay": args.adam_wd,
+                },
+                {
+                    "params": scalar_no_decay_params,
+                    "lr": args.scalar_lr,
+                    "base_lr": args.scalar_lr,
+                    "weight_decay": 0.0,
+                },
+            ],
             betas=(args.beta1, args.beta2),
             eps=args.adam_eps,
             fused=True,
-        )
-        replicated_params.append(base_model.lm_head.weight)
-    optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar]
-    if optimizer_head is not None:
-        optimizers.append(optimizer_head)
-    n_params = sum(p.numel() for p in base_model.parameters())
-    mtp_params = sum(p.numel() for p in base_model.mtp_heads.parameters())
+)
+        # Non-bank params that need manual all-reduce (replicated across GPUs)
+        replicated_params = list(optimizer_tok.param_groups[0]["params"])
+        for pg in optimizer_tok.param_groups[1:]:
+            replicated_params.extend(pg["params"])
+        replicated_params.extend(scalar_params)
+        replicated_params.extend(scalar_no_decay_params)
+
+        optimizer_head = None
+        if base_model.lm_head is not None:
+            optimizer_head = torch.optim.Adam(
+                [{"params": [base_model.lm_head.weight], "lr": args.head_lr, "base_lr": args.head_lr}],
+                betas=(args.beta1, args.beta2),
+                eps=args.adam_eps,
+                fused=True,
+            )
+            replicated_params.append(base_model.lm_head.weight)
+        optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar]
+        if optimizer_head is not None:
+            optimizers.append(optimizer_head)
+        n_params = sum(p.numel() for p in base_model.parameters())
+        mtp_params = sum(p.numel() for p in base_model.mtp_heads.parameters())
     log0(f"model_params:{n_params}")
     log0(f"mtp_num_heads:{args.mtp_num_heads} mtp_loss_weight:{args.mtp_loss_weight} mtp_params:{mtp_params}")
     xsa_layers = [i for i, b in enumerate(base_model.blocks) if b.attn.use_xsa]
@@ -2009,7 +2030,7 @@ def main() -> None:
             lawa_queue.append({name: t.detach().cpu().clone() for name, t in base_model.state_dict().items()})
         should_log_train = (
             args.train_log_every > 0
-            and (step <= 10 or step % args.train_log_every == 0 or stop_after_step is not None)
+            and (step <= 2000 or step % args.train_log_every == 0 or stop_after_step is not None)
         )
         if should_log_train:
             log0(
