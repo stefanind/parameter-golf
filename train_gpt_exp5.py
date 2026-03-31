@@ -2127,6 +2127,8 @@ def main() -> None:
                     dist.all_reduce(p.grad, op=dist.ReduceOp.AVG)
         optimizer_tok.step()
         optimizer_scalar.step()
+        if optimizer_adapter is not None:
+            optimizer_adapter.step()
         if optimizer_head is not None:
             optimizer_head.step()
         # Phase 3: Wait for RS, local NS5, all-gather (banks processed last)
