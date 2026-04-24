@@ -1,3 +1,9 @@
+"""
+The `train_gpt.py` and `train_gpt_mlx.py` scripts are intended as good launching-off points for new participants, not SOTA configs. We'll accept PRs that tune, improve, or simplify these scripts without significantly increasing complexity, but competitive submissions should stay in the `/records` folder.
+
+Hard stop: To keep readable for newcomers, let's make sure `train_gpt.py` and `train_gpt_mlx.py` never are longer than 1500 lines.
+"""
+
 from __future__ import annotations
 
 import copy
@@ -20,7 +26,6 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel as DDP
-
 
 # -----------------------------
 # HYPERPARAMETERS
@@ -81,13 +86,21 @@ class Hyperparameters:
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
 
-    # Trainable low-rank bigram adapter.
-    bigram_adapter_rank = int(os.environ.get("BIGRAM_ADAPTER_RANK", 64))
-    bigram_adapter_lr = float(os.environ.get("BIGRAM_ADAPTER_LR", matrix_lr))
-    bigram_adapter_init_path = os.environ.get("BIGRAM_ADAPTER_INIT_PATH", "./bigram_prior.npz")
-    bigram_adapter_init_mode = os.environ.get("BIGRAM_ADAPTER_INIT_MODE", "svd")
-    bigram_adapter_init_scale = float(os.environ.get("BIGRAM_ADAPTER_INIT_SCALE", 1.0))
-    bigram_adapter_scale_init = float(os.environ.get("BIGRAM_ADAPTER_SCALE_INIT", 0.1))
+
+    # -----------------------------
+    # DISTILLATION
+    # -----------------------------
+    teacher_path = os.environ.get("TEACHER_PATH", "")
+
+    # Example: "2:2,5:5,8:8" means student layer 2 matches teacher layer 2, etc.
+    distill_layer_pairs = os.environ.get("DISTILL_LAYER_PAIRS", "8:8")
+
+    kd_temp = float(os.environ.get("KD_TEMP", 2.0))
+    kd_logit_lambda = float(os.environ.get("KD_LOGIT_LAMBDA", 0.0))
+
+    # First experiment: set DELTA_MAG_LAMBDA=0.0
+    delta_dir_lambda = float(os.environ.get("DELTA_DIR_LAMBDA", 0.01))
+    delta_mag_lambda = float(os.environ.get("DELTA_MAG_LAMBDA", 0.0))
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -648,50 +661,6 @@ class Block(nn.Module):
         return x
 
 
-def load_bigram_adapter_init(path: str, vocab_size: int, rank: int, scale: float) -> tuple[Tensor, Tensor]:
-    if rank <= 0:
-        raise ValueError(f"bigram adapter rank must be positive, got {rank}")
-    if rank > vocab_size:
-        raise ValueError(f"BIGRAM_ADAPTER_RANK={rank} exceeds vocab_size={vocab_size} for SVD init")
-
-    data = np.load(path)
-
-    if "mat" in data:
-        matrix = torch.as_tensor(data["mat"], dtype=torch.float32)
-    else:
-        required = {"rows", "cols", "log_probs", "default_log_probs"}
-        if not required.issubset(set(data.files)):
-            raise ValueError(
-                f"Expected either dense 'mat' or sparse keys {sorted(required)}, got {sorted(data.files)}"
-            )
-        rows = torch.as_tensor(data["rows"], dtype=torch.long)
-        cols = torch.as_tensor(data["cols"], dtype=torch.long)
-        log_probs = torch.as_tensor(data["log_probs"], dtype=torch.float32)
-        default_log_probs = torch.as_tensor(data["default_log_probs"], dtype=torch.float32)
-
-        matrix = default_log_probs[:, None].repeat(1, vocab_size)
-        matrix[rows, cols] = log_probs
-
-    if matrix.shape != (vocab_size, vocab_size):
-        raise ValueError(
-            f"Expected bigram matrix shape ({vocab_size}, {vocab_size}), got {tuple(matrix.shape)}"
-        )
-
-    u, s, vh = torch.linalg.svd(matrix, full_matrices=False)
-    u_r = u[:, :rank]
-    s_r = s[:rank]
-    vh_r = vh[:rank, :]
-    s_sqrt = torch.sqrt(s_r.clamp_min(0.0))
-    a = u_r * s_sqrt.unsqueeze(0)
-    b = vh_r.transpose(0, 1) * s_sqrt.unsqueeze(0)
-
-    if scale != 1.0:
-        a = a * math.sqrt(scale)
-        b = b * math.sqrt(scale)
-
-    return a.contiguous(), b.contiguous()
-
-
 class GPT(nn.Module):
     def __init__(
         self,
@@ -706,9 +675,6 @@ class GPT(nn.Module):
         logit_softcap: float,
         rope_base: float,
         qk_gain_init: float,
-        bigram_adapter_rank: int = 0,
-        bigram_adapter_scale_init: float = 0.1,
-        bigram_adapter_init: tuple[Tensor, Tensor] | None = None,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -736,17 +702,6 @@ class GPT(nn.Module):
         )
         self.final_norm = RMSNorm()
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
-        self.bigram_adapter_rank = bigram_adapter_rank
-        if bigram_adapter_rank > 0:
-            self.bigram_adapter_A = nn.Parameter(torch.empty(vocab_size, bigram_adapter_rank))
-            self.bigram_adapter_B = nn.Parameter(torch.empty(vocab_size, bigram_adapter_rank))
-            self.bigram_adapter_scale = nn.Parameter(torch.tensor(bigram_adapter_scale_init, dtype=torch.float32))
-            self._bigram_adapter_init = bigram_adapter_init
-        else:
-            self.bigram_adapter_A = None
-            self.bigram_adapter_B = None
-            self.bigram_adapter_scale = None
-            self._bigram_adapter_init = None
         if self.lm_head is not None:
             self.lm_head._zero_init = True
         self._init_weights()
@@ -754,16 +709,6 @@ class GPT(nn.Module):
     def _init_weights(self) -> None:
         if self.tie_embeddings:
             nn.init.normal_(self.tok_emb.weight, mean=0.0, std=self.tied_embed_init_std)
-        if self.bigram_adapter_rank > 0:
-            if self._bigram_adapter_init is not None:
-                a_init, b_init = self._bigram_adapter_init
-                with torch.no_grad():
-                    self.bigram_adapter_A.copy_(a_init)
-                    self.bigram_adapter_B.copy_(b_init)
-            else:
-                std = 1.0 / math.sqrt(max(self.bigram_adapter_rank, 1))
-                nn.init.normal_(self.bigram_adapter_A, mean=0.0, std=std)
-                nn.init.normal_(self.bigram_adapter_B, mean=0.0, std=std)
         for module in self.modules():
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
@@ -791,17 +736,181 @@ class GPT(nn.Module):
             if self.lm_head is None:
                 raise RuntimeError("lm_head is required when tie_embeddings=False")
             logits_proj = self.lm_head(x)
-
-        if self.bigram_adapter_rank > 0:
-            if self.bigram_adapter_A is None or self.bigram_adapter_B is None or self.bigram_adapter_scale is None:
-                raise RuntimeError("bigram adapter parameters are missing")
-            adapter_rows = F.embedding(input_ids, self.bigram_adapter_A).reshape(-1, self.bigram_adapter_rank)
-            adapter_logits = adapter_rows @ self.bigram_adapter_B.transpose(0, 1).to(dtype=adapter_rows.dtype)
-            logits_proj = logits_proj + self.bigram_adapter_scale.to(dtype=logits_proj.dtype) * adapter_logits
-
         logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
         return F.cross_entropy(logits.float(), targets, reduction="mean")
 
+    def forward_with_deltas(
+        self,
+        input_ids: Tensor,
+        target_ids: Tensor | None = None,
+        capture_layers: set[int] | None = None,
+    ) -> dict[str, Tensor | dict[int, Tensor]]:
+        """
+        Forward pass that returns:
+        - logits
+        - optional CE loss
+        - selected layer deltas
+
+        Delta means:
+            delta_l = h_after_block_l - h_before_block_l
+
+        For decoder layers, the skip connection is applied before defining the block delta.
+        So delta measures the transform done by the transformer block after skip injection.
+        """
+        if capture_layers is None:
+            capture_layers = set()
+
+        deltas: dict[int, Tensor] = {}
+
+        x = self.tok_emb(input_ids)
+        x = F.rms_norm(x, (x.size(-1),))
+        x0 = x
+        skips: list[Tensor] = []
+
+        # Encoder half.
+        for i in range(self.num_encoder_layers):
+            x_before = x
+            x = self.blocks[i](x, x0)
+
+            if i in capture_layers:
+                deltas[i] = x - x_before
+
+            skips.append(x)
+
+        # Decoder half.
+        for j in range(self.num_decoder_layers):
+            layer_idx = self.num_encoder_layers + j
+
+            if skips:
+                x = x + self.skip_weights[j].to(dtype=x.dtype)[None, None, :] * skips.pop()
+
+            x_before = x
+            x = self.blocks[layer_idx](x, x0)
+
+            if layer_idx in capture_layers:
+                deltas[layer_idx] = x - x_before
+
+        x = self.final_norm(x)
+
+        bsz, seqlen, dim = x.shape
+        x_flat = x.reshape(-1, dim)
+
+        if self.tie_embeddings:
+            logits_proj = F.linear(x_flat, self.tok_emb.weight)
+        else:
+            if self.lm_head is None:
+                raise RuntimeError("lm_head is required when tie_embeddings=False")
+            logits_proj = self.lm_head(x_flat)
+
+        logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
+        logits = logits.reshape(bsz, seqlen, -1)
+
+        out: dict[str, Tensor | dict[int, Tensor]] = {
+            "logits": logits,
+            "deltas": deltas,
+        }
+
+        if target_ids is not None:
+            ce_loss = F.cross_entropy(
+                logits.reshape(-1, logits.size(-1)).float(),
+                target_ids.reshape(-1),
+                reduction="mean",
+            )
+            out["ce_loss"] = ce_loss
+
+        return out
+
+
+
+def delta_distill_losses(
+    student_deltas: dict[int, Tensor],
+    teacher_deltas: dict[int, Tensor],
+    layer_pairs: list[tuple[int, int]],
+    compute_magnitude: bool,
+    eps: float = 1e-6,
+) -> tuple[Tensor, Tensor]:
+    """
+    Returns:
+      direction_loss:
+          1 - cosine similarity between student and teacher update directions
+
+      magnitude_loss:
+          log-norm MSE between student and teacher update sizes
+
+    Assumes same hidden dimension.
+    """
+    if not layer_pairs:
+        device = next(iter(student_deltas.values())).device
+        zero = torch.zeros((), device=device)
+        return zero, zero
+
+    dir_losses: list[Tensor] = []
+    mag_losses: list[Tensor] = []
+
+    for student_layer, teacher_layer in layer_pairs:
+        delta_s = student_deltas[student_layer].float()
+        delta_t = teacher_deltas[teacher_layer].float()
+
+        dir_loss = 1.0 - F.cosine_similarity(
+            delta_s,
+            delta_t,
+            dim=-1,
+            eps=eps,
+        ).mean()
+
+        dir_losses.append(dir_loss)
+
+        if compute_magnitude:
+            norm_s = delta_s.norm(dim=-1).clamp_min(eps)
+            norm_t = delta_t.norm(dim=-1).clamp_min(eps)
+            mag_loss = F.mse_loss(torch.log(norm_s), torch.log(norm_t))
+            mag_losses.append(mag_loss)
+
+    direction_loss = torch.stack(dir_losses).mean()
+
+    if compute_magnitude:
+        magnitude_loss = torch.stack(mag_losses).mean()
+    else:
+        magnitude_loss = torch.zeros((), device=direction_loss.device)
+
+    return direction_loss, magnitude_loss
+
+
+def parse_layer_pairs(spec: str) -> list[tuple[int, int]]:
+    """
+    Parses "2:2,5:5,8:8" into [(2, 2), (5, 5), (8, 8)].
+
+    Format:
+        student_layer:teacher_layer
+    """
+    pairs: list[tuple[int, int]] = []
+    if not spec.strip():
+        return pairs
+
+    for item in spec.split(","):
+        left, right = item.split(":")
+        pairs.append((int(left), int(right)))
+
+    return pairs
+
+
+def logit_kd_loss(student_logits: Tensor, teacher_logits: Tensor, temperature: float) -> Tensor:
+    """
+    KL(student || teacher) using softened teacher logits.
+
+    student_logits, teacher_logits:
+        [B, T, vocab]
+    """
+    vocab = student_logits.size(-1)
+
+    s = student_logits.reshape(-1, vocab).float() / temperature
+    t = teacher_logits.reshape(-1, vocab).float() / temperature
+
+    return F.kl_div(
+        F.log_softmax(s, dim=-1),
+        F.softmax(t, dim=-1),
+        reduction="batchmean",
+    ) * (temperature * temperature)
 
 # -----------------------------
 # TRAINING
@@ -902,20 +1011,6 @@ def main() -> None:
     # MODEL + OPTIMIZER SETUP
     # -----------------------------
 
-    bigram_adapter_init = None
-    if args.bigram_adapter_rank > 0 and args.bigram_adapter_init_path:
-        init_mode = args.bigram_adapter_init_mode.lower()
-        if init_mode != "svd":
-            raise ValueError(
-                f"Unsupported BIGRAM_ADAPTER_INIT_MODE={args.bigram_adapter_init_mode}; expected 'svd'"
-            )
-        bigram_adapter_init = load_bigram_adapter_init(
-            args.bigram_adapter_init_path,
-            args.vocab_size,
-            args.bigram_adapter_rank,
-            args.bigram_adapter_init_scale,
-        )
-
     base_model = GPT(
         vocab_size=args.vocab_size,
         num_layers=args.num_layers,
@@ -928,9 +1023,6 @@ def main() -> None:
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
-        bigram_adapter_rank=args.bigram_adapter_rank,
-        bigram_adapter_scale_init=args.bigram_adapter_scale_init,
-        bigram_adapter_init=bigram_adapter_init,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -938,6 +1030,52 @@ def main() -> None:
     restore_low_dim_params_to_fp32(base_model)
     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
+
+    teacher_model: GPT | None = None
+
+    layer_pairs = parse_layer_pairs(args.distill_layer_pairs)
+    student_capture_layers = {s for s, _ in layer_pairs}
+    teacher_capture_layers = {t for _, t in layer_pairs}
+
+    if args.teacher_path:
+        teacher_model = GPT(
+            vocab_size=args.vocab_size,
+            num_layers=args.num_layers,
+            model_dim=args.model_dim,
+            num_heads=args.num_heads,
+            num_kv_heads=args.num_kv_heads,
+            mlp_mult=args.mlp_mult,
+            tie_embeddings=args.tie_embeddings,
+            tied_embed_init_std=args.tied_embed_init_std,
+            logit_softcap=args.logit_softcap,
+            rope_base=args.rope_base,
+            qk_gain_init=args.qk_gain_init,
+        ).to(device).bfloat16()
+
+        for module in teacher_model.modules():
+            if isinstance(module, CastedLinear):
+                module.float()
+
+        restore_low_dim_params_to_fp32(teacher_model)
+
+        if args.teacher_path.endswith(".ptz"):
+            with open(args.teacher_path, "rb") as f:
+                quant_blob = f.read()
+            quant_state = torch.load(io.BytesIO(zlib.decompress(quant_blob)), map_location="cpu")
+            teacher_state = dequantize_state_dict_int8(quant_state)
+        else:
+            teacher_state = torch.load(args.teacher_path, map_location="cpu")
+
+        teacher_model.load_state_dict(teacher_state, strict=True)
+        teacher_model.eval()
+
+        for p in teacher_model.parameters():
+            p.requires_grad_(False)
+
+        log0(f"teacher_loaded:{args.teacher_path}")
+        log0(f"distill_layer_pairs:{layer_pairs}")
+
+
 
     # Optimizer split:
     # - token embedding (Adam) uses EMBED_LR
@@ -957,11 +1095,6 @@ def main() -> None:
     ]
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
-    adapter_matrix_params: list[Tensor] = []
-    if base_model.bigram_adapter_A is not None and base_model.bigram_adapter_B is not None:
-        adapter_matrix_params.extend([base_model.bigram_adapter_A, base_model.bigram_adapter_B])
-    if base_model.bigram_adapter_scale is not None:
-        scalar_params.append(base_model.bigram_adapter_scale)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
@@ -977,16 +1110,6 @@ def main() -> None:
     )
     for group in optimizer_muon.param_groups:
         group["base_lr"] = args.matrix_lr
-
-    optimizer_adapter = None
-    if adapter_matrix_params:
-        optimizer_adapter = torch.optim.Adam(
-            [{"params": adapter_matrix_params, "lr": args.bigram_adapter_lr, "base_lr": args.bigram_adapter_lr}],
-            betas=(args.beta1, args.beta2),
-            eps=args.adam_eps,
-            fused=True,
-        )
-
     optimizer_scalar = torch.optim.Adam(
         [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
         betas=(args.beta1, args.beta2),
@@ -994,8 +1117,6 @@ def main() -> None:
         fused=True,
     )
     optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar]
-    if optimizer_adapter is not None:
-        optimizers.append(optimizer_adapter)
     if base_model.lm_head is not None:
         optimizer_head = torch.optim.Adam(
             [{"params": [base_model.lm_head.weight], "lr": args.head_lr, "base_lr": args.head_lr}],
@@ -1014,13 +1135,6 @@ def main() -> None:
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
-    )
-    log0(
-        f"bigram_adapter_rank:{args.bigram_adapter_rank} bigram_adapter_lr:{args.bigram_adapter_lr} "
-        f"bigram_adapter_init_mode:{args.bigram_adapter_init_mode} "
-        f"bigram_adapter_init_path:{args.bigram_adapter_init_path or 'none'} "
-        f"bigram_adapter_init_scale:{args.bigram_adapter_init_scale} "
-        f"bigram_adapter_scale_init:{args.bigram_adapter_scale_init}"
     )
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
@@ -1127,16 +1241,94 @@ def main() -> None:
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         scale = lr_mul(step, elapsed_ms)
         zero_grad_all()
+
         train_loss = torch.zeros((), device=device)
+        kd_loss_meter = torch.zeros((), device=device)
+        dir_loss_meter = torch.zeros((), device=device)
+        mag_loss_meter = torch.zeros((), device=device)
+
         for micro_step in range(grad_accum_steps):
             if distributed:
                 model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
-            x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
+
+            x, y = train_loader.next_batch(
+                args.train_batch_tokens,
+                args.train_seq_len,
+                grad_accum_steps,
+            )
+
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                loss = model(x, y)
-            train_loss += loss.detach()
+                if teacher_model is None:
+                    loss = model(x, y)
+                    ce_loss = loss
+
+                    kd_loss = torch.zeros((), device=device)
+                    dir_loss = torch.zeros((), device=device)
+                    mag_loss = torch.zeros((), device=device)
+
+                else:
+                    # Teacher forward: frozen, no gradients.
+                    with torch.no_grad():
+                        teacher_out = teacher_model.forward_with_deltas(
+                            x,
+                            target_ids=None,
+                            capture_layers=teacher_capture_layers,
+                        )
+
+                    # Student forward: gradients enabled.
+                    # This bypasses DDP, so use single-GPU for this experiment.
+                    student_out = base_model.forward_with_deltas(
+                        x,
+                        target_ids=y,
+                        capture_layers=student_capture_layers,
+                    )
+
+                    ce_loss = student_out["ce_loss"]
+                    student_logits = student_out["logits"]
+                    teacher_logits = teacher_out["logits"]
+                    student_deltas = student_out["deltas"]
+                    teacher_deltas = teacher_out["deltas"]
+
+                    assert isinstance(ce_loss, Tensor)
+                    assert isinstance(student_logits, Tensor)
+                    assert isinstance(teacher_logits, Tensor)
+                    assert isinstance(student_deltas, dict)
+                    assert isinstance(teacher_deltas, dict)
+
+                    if args.kd_logit_lambda > 0.0:
+                        kd_loss = logit_kd_loss(
+                            student_logits,
+                            teacher_logits,
+                            args.kd_temp,
+                        )
+                    else:
+                        kd_loss = torch.zeros((), device=device)
+
+                    dir_loss, mag_loss = delta_distill_losses(
+                        student_deltas,
+                        teacher_deltas,
+                        layer_pairs,
+                        compute_magnitude=args.delta_mag_lambda > 0.0,
+                    )
+
+                    loss = (
+                        ce_loss
+                        + args.kd_logit_lambda * kd_loss
+                        + args.delta_dir_lambda * dir_loss
+                        + args.delta_mag_lambda * mag_loss
+                    )
+
+            train_loss += ce_loss.detach()
+            kd_loss_meter += kd_loss.detach()
+            dir_loss_meter += dir_loss.detach()
+            mag_loss_meter += mag_loss.detach()
+
             (loss * grad_scale).backward()
+
         train_loss /= grad_accum_steps
+        kd_loss_meter /= grad_accum_steps
+        dir_loss_meter /= grad_accum_steps
+        mag_loss_meter /= grad_accum_steps
 
         frac = min(step / args.muon_momentum_warmup_steps, 1.0) if args.muon_momentum_warmup_steps > 0 else 1.0
         muon_momentum = (1 - frac) * args.muon_momentum_warmup_start + frac * args.muon_momentum
@@ -1160,10 +1352,22 @@ def main() -> None:
             and (step <= 10 or step % args.train_log_every == 0 or stop_after_step is not None)
         )
         if should_log_train:
-            log0(
-                f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
-                f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
-            )
+            if teacher_model is None:
+                log0(
+                    f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
+                    f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
+                )
+            else:
+                log0(
+                    f"step:{step}/{args.iterations} "
+                    f"ce_loss:{train_loss.item():.4f} "
+                    f"kd_loss:{kd_loss_meter.item():.4f} "
+                    f"delta_dir:{dir_loss_meter.item():.4f} "
+                    f"delta_mag:{mag_loss_meter.item():.4f} "
+                    f"avg_cos:{1.0 - dir_loss_meter.item():.4f} "
+                    f"train_time:{approx_training_time_ms:.0f}ms "
+                    f"step_avg:{approx_training_time_ms / step:.2f}ms"
+                )
 
         # Needed to sync whether we've reached the wallclock cap.
         reached_cap = max_wallclock_ms is not None and approx_training_time_ms >= max_wallclock_ms
@@ -1186,8 +1390,8 @@ def main() -> None:
     # the compressed int8+zlib artifact and validate the round-tripped weights.
 
     if master_process:
-        torch.save(base_model.state_dict(), "low_rank_adapter.pt")
-        model_bytes = os.path.getsize("low_rank_adapter.pt")
+        torch.save(base_model.state_dict(), "teacher_directional.pt")
+        model_bytes = os.path.getsize("teacher_directional.pt")
         code_bytes = len(code.encode("utf-8"))
         log0(f"Serialized model: {model_bytes} bytes")
         log0(f"Code size: {code_bytes} bytes")
@@ -1200,9 +1404,9 @@ def main() -> None:
     quant_blob = zlib.compress(quant_raw, level=9)
     quant_raw_bytes = len(quant_raw)
     if master_process:
-        with open("low_rank_adapter.int8.ptz", "wb") as f:
+        with open("teacher_directional.int8.ptz", "wb") as f:
             f.write(quant_blob)
-        quant_file_bytes = os.path.getsize("low_rank_adapter.int8.ptz")
+        quant_file_bytes = os.path.getsize("teacher_directional.int8.ptz")
         code_bytes = len(code.encode("utf-8"))
         ratio = quant_stats["baseline_tensor_bytes"] / max(quant_stats["int8_payload_bytes"], 1)
         log0(
@@ -1213,7 +1417,7 @@ def main() -> None:
 
     if distributed:
         dist.barrier()
-    with open("low_rank_adapter.int8.ptz", "rb") as f:
+    with open("teacher_directional.int8.ptz", "rb") as f:
         quant_blob_disk = f.read()
     quant_state = torch.load(io.BytesIO(zlib.decompress(quant_blob_disk)), map_location="cpu")
     base_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=True)
